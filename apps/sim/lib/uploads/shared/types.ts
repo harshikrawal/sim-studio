@@ -1,0 +1,107 @@
+/**
+ * Defense-in-depth ceiling on the size of any single workspace file upload.
+ * Enforced both server-side (presigned route) and client-side (Files tab) so
+ * users get fast feedback before bytes are streamed.
+ */
+export const MAX_WORKSPACE_FILE_SIZE = 5 * 1024 * 1024 * 1024
+
+/**
+ * Cap on the legacy FormData upload route, which buffers the whole file in
+ * worker memory. Direct-to-storage uploads use {@link MAX_WORKSPACE_FILE_SIZE}.
+ */
+export const MAX_WORKSPACE_FORMDATA_FILE_SIZE = 100 * 1024 * 1024
+
+export type StorageContext =
+  | 'knowledge-base'
+  | 'chat'
+  | 'copilot'
+  | 'mothership'
+  | 'execution'
+  | 'workspace'
+  | 'profile-pictures'
+  | 'og-images'
+  | 'logs'
+  | 'workspace-logos'
+
+/**
+ * Contexts exempt from storage quota checks. Includes system-internal contexts
+ * (`logs` — written by the execution pipeline, not user-initiated) and small
+ * metadata assets (`profile-pictures`, `workspace-logos`, `og-images`).
+ * Mothership chat attachments are also exempt because they are not counted as
+ * durable workspace-file storage.
+ *
+ * The small-asset and system contexts are excluded from the multipart endpoint.
+ * Mothership remains available there for large chat attachments while retaining
+ * the same quota exemption as its single-part upload path.
+ */
+export const QUOTA_EXEMPT_STORAGE_CONTEXTS = new Set<StorageContext>([
+  'mothership',
+  'profile-pictures',
+  'workspace-logos',
+  'og-images',
+  'logs',
+])
+
+export interface FileInfo {
+  path: string
+  key: string
+  name: string
+  size: number
+  type: string
+}
+
+export interface StorageConfig {
+  bucket?: string
+  region?: string
+  containerName?: string
+  accountName?: string
+  accountKey?: string
+  connectionString?: string
+}
+
+export interface UploadFileOptions {
+  file: Buffer
+  fileName: string
+  contentType: string
+  context: StorageContext
+  preserveKey?: boolean
+  customKey?: string
+  metadata?: Record<string, string>
+  /**
+   * Whether the storage service should also persist its generic metadata row.
+   * Disable when a caller finalizes metadata in its own database transaction.
+   */
+  persistMetadata?: boolean
+}
+
+export interface DownloadFileOptions {
+  key: string
+  context?: StorageContext
+  maxBytes?: number
+}
+
+export interface DeleteFileOptions {
+  key: string
+  context?: StorageContext
+}
+
+export interface GeneratePresignedUrlOptions {
+  fileName: string
+  contentType: string
+  fileSize: number
+  context: StorageContext
+  userId?: string
+  expirationSeconds?: number
+  metadata?: Record<string, string>
+  /**
+   * When provided, overrides the default `${context}/${timestamp}-${id}-${name}` key derivation.
+   * The caller takes responsibility for uniqueness and prefix conventions.
+   */
+  customKey?: string
+}
+
+export interface PresignedUrlResponse {
+  url: string
+  key: string
+  uploadHeaders?: Record<string, string>
+}

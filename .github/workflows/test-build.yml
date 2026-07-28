@@ -1,0 +1,297 @@
+name: Test and Build
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-build:
+    name: Lint and Test
+    runs-on: ${{ (vars.CI_PROVIDER == '' || vars.CI_PROVIDER == 'blacksmith') && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.3.13
+
+      - name: Setup Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: 22
+
+      # Cache keys are scoped by event name, and fork PRs get their own
+      # namespace on top: untrusted fork runs must never share a cache with
+      # push runs (whose caches feed production image builds) or with trusted
+      # internal-PR runs.
+      #
+      # node_modules also keys on the lockfile hash: a sticky disk is a mutable
+      # volume, and `bun install --frozen-lockfile` adds what the lockfile needs
+      # without pruning what it dropped, so branches on different lockfiles were
+      # contaminating each other (a stale @next/swc 16.2.6 outlived the 16.2.11
+      # bump). The bun and Turbo caches are content/hash-addressed, so they stay
+      # shared — that is what keeps a fresh node_modules disk cheap to fill.
+      - name: Mount Bun cache
+        uses: ./.github/actions/cache-mount
+        with:
+          provider: ${{ vars.CI_PROVIDER }}
+          key: ${{ github.repository }}-bun-cache-${{ github.event_name }}${{ github.event.pull_request.head.repo.fork && '-fork' || '' }}
+          path: ~/.bun/install/cache
+
+      - name: Mount node_modules
+        uses: ./.github/actions/cache-mount
+        with:
+          provider: ${{ vars.CI_PROVIDER }}
+          key: ${{ github.repository }}-node-modules-${{ github.event_name }}${{ github.event.pull_request.head.repo.fork && '-fork' || '' }}-${{ hashFiles('bun.lock') }}
+          path: ./node_modules
+
+      - name: Mount Turbo cache
+        uses: ./.github/actions/cache-mount
+        with:
+          provider: ${{ vars.CI_PROVIDER }}
+          key: ${{ github.repository }}-turbo-cache-${{ github.event_name }}${{ github.event.pull_request.head.repo.fork && '-fork' || '' }}
+          path: ./.turbo
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      # Surfaces known CVEs in the dependency tree. Non-blocking until the
+      # existing advisory backlog is triaged, then flip to a required gate by
+      # removing continue-on-error.
+      - name: Security audit
+        run: bun audit
+        continue-on-error: true
+
+      - name: Validate env flags
+        run: |
+          FILE="apps/sim/lib/core/config/env-flags.ts"
+          ERRORS=""
+
+          echo "Checking for hardcoded boolean env flags..."
+
+          # Use perl for multiline matching to catch both:
+          #   export const isHosted = true
+          #   export const isHosted =
+          #     true
+          HARDCODED=$(perl -0777 -ne 'while (/export const (is[A-Za-z]+)\s*=\s*\n?\s*(true|false)\b/g) { print "  $1 = $2\n" }' "$FILE")
+
+          if [ -n "$HARDCODED" ]; then
+            ERRORS="${ERRORS}\n❌ Env flags must not be hardcoded to boolean literals!\n\nFound hardcoded flags:\n${HARDCODED}\n\nEnv flags should derive their values from environment variables.\n"
+          fi
+
+          echo "Checking env flag naming conventions..."
+
+          # Check that all export const (except functions) start with 'is'
+          # This finds exports like "export const someFlag" that don't start with "is" or "get"
+          BAD_NAMES=$(grep -E "^export const [a-z]" "$FILE" | grep -vE "^export const (is|get)" | sed 's/export const \([a-zA-Z]*\).*/  \1/')
+
+          if [ -n "$BAD_NAMES" ]; then
+            ERRORS="${ERRORS}\n❌ Env flags must use 'is' prefix for boolean flags!\n\nFound incorrectly named flags:\n${BAD_NAMES}\n\nExample: 'hostedMode' should be 'isHostedMode'\n"
+          fi
+
+          if [ -n "$ERRORS" ]; then
+            echo ""
+            echo -e "$ERRORS"
+            exit 1
+          fi
+
+          echo "✅ All env flags are properly configured"
+
+      - name: Check block registry invariants
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE_REF="origin/${{ github.base_ref }}"
+            git fetch --depth=1 origin "${{ github.base_ref }}" 2>/dev/null || true
+          else
+            BASE_REF="HEAD~1"
+          fi
+          bun run apps/sim/scripts/check-block-registry.ts "$BASE_REF"
+
+      - name: Lint code
+        run: bun run lint:check
+
+      - name: Enforce monorepo boundaries
+        run: bun run check:boundaries
+
+      - name: API contract boundary audit
+        run: bun run check:api-validation:strict
+
+      - name: Shared utils enforcement audit
+        run: bun run check:utils
+
+      - name: Zustand v5 selector audit
+        run: bun run check:zustand-v5
+
+      - name: React Query pattern audit
+        run: bun run check:react-query
+
+      - name: Client boundary import audit
+        run: bun run check:client-boundary
+
+      - name: Bare-icon theme-safety audit
+        run: bun run check:bare-icons
+
+      - name: Icon SVG path validity audit
+        run: bun run check:icon-paths
+
+      - name: Verify realtime prune graph
+        run: bun run check:realtime-prune
+
+      - name: Verify skill projections are in sync
+        run: bun run skills:check
+
+      - name: Verify agent stream capability docs are in sync
+        run: bun run agent-stream-docs:check
+
+      - name: Migration safety (zero-downtime) audit
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE_REF="origin/${{ github.base_ref }}"
+            git fetch --depth=1 origin "${{ github.base_ref }}" 2>/dev/null || true
+          else
+            BASE_REF="HEAD~1"
+          fi
+          bun run check:migrations "$BASE_REF"
+
+      - name: Type-check realtime server
+        run: bunx turbo run type-check --filter=@sim/realtime
+
+      # cloud-review-tools.test.ts runs the real helper on the runner, which shells
+      # out to rg. Blacksmith's image ships it, GitHub's doesn't.
+      - name: Install ripgrep
+        run: command -v rg || (sudo apt-get update && sudo apt-get install -y ripgrep)
+
+      - name: Run tests with coverage
+        env:
+          NODE_OPTIONS: '--no-warnings --max-old-space-size=8192'
+          NEXT_PUBLIC_APP_URL: 'https://www.sim.ai'
+          DATABASE_URL: 'postgresql://postgres:postgres@localhost:5432/simstudio'
+          ENCRYPTION_KEY: '7cf672e460e430c1fba707575c2b0e2ad5a99dddf9b7b7e3b5646e630861db1c' # dummy key for CI only
+          TURBO_CACHE_DIR: .turbo
+        run: bun run test
+
+      - name: Check schema and migrations are in sync
+        working-directory: packages/db
+        run: |
+          bunx drizzle-kit generate --config=./drizzle.config.ts
+          if [ -n "$(git status --porcelain ./migrations)" ]; then
+            echo "❌ Schema and migrations are out of sync!"
+            echo "Run 'cd packages/db && bunx drizzle-kit generate' and commit the new migrations."
+            git status --porcelain ./migrations
+            git diff ./migrations
+            exit 1
+          fi
+          echo "✅ Schema and migrations are in sync"
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac # v5
+        with:
+          directory: ./apps/sim/coverage
+          fail_ci_if_error: false
+          verbose: true
+
+  # Next.js production build, in parallel with lint + tests. Sticky disks are
+  # cloned from the last committed snapshot per job and committed last-writer-
+  # wins, so concurrent mounts are safe. The bun/node_modules disks are shared
+  # with test-build (the lockfile-hashed key means they only ever share when the
+  # dependency tree really is identical, so LWW loss is harmless), but the Turbo
+  # cache gets its own key: with a shared key, only the last committer's new
+  # entries survive each run, so the test and build Turbo entries would evict
+  # each other nondeterministically.
+  #
+  # Runner is sized for the COLD-cache build, which is what OOM-killed the 8vcpu
+  # tier (23 kills / 1074 runs at 98% of its 30.4 GB): warm peaks ~12 GB, cold
+  # peaked 51 GB. NODE_OPTIONS' --max-old-space-size caps only Node's JS heap,
+  # not the native Turbopack workers that dominate, so it cannot prevent this.
+  build:
+    name: Build App
+    runs-on: ${{ (vars.CI_PROVIDER == '' || vars.CI_PROVIDER == 'blacksmith') && 'blacksmith-16vcpu-ubuntu-2404' || 'linux-x64-8-core' }}
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.3.13
+
+      - name: Setup Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: 22
+
+      - name: Mount Bun cache
+        uses: ./.github/actions/cache-mount
+        with:
+          provider: ${{ vars.CI_PROVIDER }}
+          key: ${{ github.repository }}-bun-cache-${{ github.event_name }}${{ github.event.pull_request.head.repo.fork && '-fork' || '' }}
+          path: ~/.bun/install/cache
+
+      - name: Mount node_modules
+        uses: ./.github/actions/cache-mount
+        with:
+          provider: ${{ vars.CI_PROVIDER }}
+          key: ${{ github.repository }}-node-modules-${{ github.event_name }}${{ github.event.pull_request.head.repo.fork && '-fork' || '' }}-${{ hashFiles('bun.lock') }}
+          path: ./node_modules
+
+      - name: Mount Turbo cache
+        uses: ./.github/actions/cache-mount
+        with:
+          provider: ${{ vars.CI_PROVIDER }}
+          key: ${{ github.repository }}-turbo-cache-build-${{ github.event_name }}${{ github.event.pull_request.head.repo.fork && '-fork' || '' }}
+          path: ./.turbo
+
+      # Turbopack's persistent build cache (NEXT_TURBOPACK_BUILD_CACHE below)
+      # writes ~5 GB into .next/cache — a sticky disk mounts it in ~1s where an
+      # actions/cache round-trip would eat the warm-build win. Same event/fork
+      # namespacing as the other mounts; the GitHub fallback inside cache-mount
+      # still uses actions/cache with a run_id-suffixed key.
+      - name: Mount Next.js build cache
+        uses: ./.github/actions/cache-mount
+        with:
+          provider: ${{ vars.CI_PROVIDER }}
+          key: ${{ github.repository }}-nextjs-cache-${{ github.event_name }}${{ github.event.pull_request.head.repo.fork && '-fork' || '' }}
+          path: ./apps/sim/.next/cache
+
+      # Running out of RAM kills the whole VM and surfaces only as "the runner
+      # has received a shutdown signal" — no mention of memory, ~12 min in. Warn
+      # with the real numbers so that failure is a one-line diagnosis instead of
+      # a mystery. Warn, never fail: a warm build peaks ~12 GB and a partial one
+      # ~28 GB, so a 32 GB runner still completes plenty of builds, and the
+      # GitHub fallback is the break-glass path — degrading it to a guaranteed
+      # failure would be worse than the risk this flags.
+      - name: Check runner memory headroom
+        run: |
+          TOTAL_GB=$(awk '/MemTotal/ {printf "%d", $2/1048576}' /proc/meminfo)
+          echo "Runner memory: ${TOTAL_GB} GB"
+          if [ "$TOTAL_GB" -lt 40 ]; then
+            echo "::warning::Runner has ${TOTAL_GB} GB. A cold-cache build peaks ~51 GB, so this run may be OOM-killed (reported only as 'the runner has received a shutdown signal'). Warm/partial builds should still fit."
+          fi
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build application
+        env:
+          NODE_OPTIONS: '--no-warnings --max-old-space-size=8192'
+          NEXT_PUBLIC_APP_URL: 'https://www.sim.ai'
+          DATABASE_URL: 'postgresql://postgres:postgres@localhost:5432/simstudio'
+          STRIPE_SECRET_KEY: 'dummy_key_for_ci_only'
+          STRIPE_WEBHOOK_SECRET: 'dummy_secret_for_ci_only'
+          RESEND_API_KEY: 'dummy_key_for_ci_only'
+          AWS_REGION: 'us-west-2'
+          ENCRYPTION_KEY: '7cf672e460e430c1fba707575c2b0e2ad5a99dddf9b7b7e3b5646e630861db1c' # dummy key for CI only
+          TURBO_CACHE_DIR: .turbo
+          # Opt into Turbopack's persistent build cache (beta) for this CI
+          # check build only — measured 105s cold vs 22s warm locally.
+          NEXT_TURBOPACK_BUILD_CACHE: '1'
+        run: bunx turbo run build --filter=sim
